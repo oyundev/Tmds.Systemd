@@ -73,12 +73,12 @@ namespace Tmds.Systemd.Tool
             return true;
         }
 
-        private static bool FindDotnetPath(out string dotnetPathValue)
+        private static bool FindProgramInPath(string program, out string programPath)
         {
-            dotnetPathValue = FindProgramInPath("dotnet");
-            if (dotnetPathValue == null)
+            programPath = FindProgramInPath(program);
+            if (programPath == null)
             {
-                System.Console.WriteLine("Cannot find dotnet on PATH");
+                System.Console.WriteLine($"Cannot find {program} on PATH");
                 return false;
             }
 
@@ -115,7 +115,7 @@ namespace Tmds.Systemd.Tool
             
             if (!GetRequired(commandOptions, "name", out string unitName) ||
                 !ResolveAssembly(application, out string applicationPath) ||
-                !FindDotnetPath(out string dotnetPath))
+                !FindProgramInPath("dotnet", out string dotnetPath))
             {
                 return 1;
             }
@@ -126,9 +126,13 @@ namespace Tmds.Systemd.Tool
             string scls = Environment.GetEnvironmentVariable("X_SCLS");
             if (scls != null)
             {
-                execstart = $"scl enable ${scls} -- {execstart}";
+                string sclPath = FindProgramInPath("scl");
+                if (sclPath != null)
+                {
+                    execstart = $"{sclPath} enable {scls} -- {execstart}";
+                }
             }
-            substitutions.Add("%execstart%", dotnetPath + " " + unitName);
+            substitutions.Add("%execstart%", execstart);
             substitutions.Add("%applicationdirectory%", Path.GetDirectoryName(applicationPath));
 
             string unitFileContent = BuildUnitFile(UnitConfiguration.SystemServiceOptions, commandOptions, substitutions);
