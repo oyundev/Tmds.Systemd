@@ -7,6 +7,7 @@ using System.Text;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace Tmds.Systemd.Tool
 {
@@ -21,8 +22,9 @@ namespace Tmds.Systemd.Tool
 
         private static Command CreateServiceCommand()
         {
-            var createServiceCommand = new Command("create-service", "Creates a systemd service", handler: CommandHandler.Create(new Func<string, string, ParseResult, int>(CreateServiceHandler)));
+            var createServiceCommand = new Command("create-service", "Creates a systemd service", handler: CommandHandler.Create(new Func<string, string, bool, ParseResult, int>(CreateServiceHandler)));
             createServiceCommand.AddOption(new Option("--name", "Name of the service (required)", new Argument<string>()));
+            createServiceCommand.AddOption(new Option("--user-unit", "Create a user service", new Argument<bool>()));
             foreach (var configOption in UnitConfiguration.SystemServiceOptions)
             {
                 if (configOption.CanSet)
@@ -39,7 +41,10 @@ namespace Tmds.Systemd.Tool
             var userOptions = new Dictionary<string, string>();
             foreach (var childResult in result.CommandResult.Children)
             {
-                userOptions.Add(childResult.Name.ToUpperInvariant(), childResult.Arguments.First());
+                if (childResult.Arguments.Count > 0)
+                {
+                    userOptions.Add(childResult.Name.ToUpperInvariant(), childResult.Arguments.First());
+                }
             }
             return userOptions;
         }
@@ -63,7 +68,7 @@ namespace Tmds.Systemd.Tool
                 assemblyValue = Directory.GetFiles(assemblyValue, "*.runtimeconfig.json")
                                     .FirstOrDefault()?.Replace(".runtimeconfig.json", ".dll");
             }
-            System.Console.WriteLine(assemblyValue);
+            Console.WriteLine(assemblyValue);
             if (assemblyValue == null || !File.Exists(assemblyValue))
             {
                 Console.Error.WriteLine("Cannot determine the entrypoint assembly. Please specify it as an argument.");
@@ -78,7 +83,7 @@ namespace Tmds.Systemd.Tool
             programPath = FindProgramInPath(program);
             if (programPath == null)
             {
-                System.Console.WriteLine($"Cannot find {program} on PATH");
+                Console.WriteLine($"Cannot find {program} on PATH");
                 return false;
             }
 
@@ -109,13 +114,36 @@ namespace Tmds.Systemd.Tool
             return sb.ToString();
         }
 
-        private static int CreateServiceHandler(string name, string application, ParseResult result)
+        [DllImport("libc")]
+        public static extern int geteuid();
+
+        private static bool VerifyRunningAsRoot()
+        {
+            int euid = geteuid();
+            if (euid != 0)
+            {
+                string sudoCommand = "sudo";
+                string scls = GetSoftwareCollections();
+                if (scls != null)
+                {
+                    sudoCommand = $"{sudoCommand} scl enable {scls} --";
+                }
+                Console.WriteLine($"This command needs root. Please run it with '{sudoCommand}'.");
+                return false;
+            }
+            return true;
+        }
+
+        private static string GetSoftwareCollections() => Environment.GetEnvironmentVariable("X_SCLS");
+
+        private static int CreateServiceHandler(string name, string application, bool userUnit, ParseResult result)
         {
             var commandOptions = GetCommandOptions(result);
             
             if (!GetRequired(commandOptions, "name", out string unitName) ||
                 !ResolveAssembly(application, out string applicationPath) ||
-                !FindProgramInPath("dotnet", out string dotnetPath))
+                !FindProgramInPath("dotnet", out string dotnetPath) ||
+                (!userUnit && !VerifyRunningAsRoot()))
             {
                 return 1;
             }
@@ -123,7 +151,7 @@ namespace Tmds.Systemd.Tool
             var substitutions = new Dictionary<string, string>();
             substitutions.Add("%name%", unitName);
             string execstart = $"'{dotnetPath}' '{applicationPath}'";
-            string scls = Environment.GetEnvironmentVariable("X_SCLS");
+            string scls = GetSoftwareCollections();
             if (scls != null)
             {
                 string sclPath = FindProgramInPath("scl");
@@ -137,9 +165,21 @@ namespace Tmds.Systemd.Tool
 
             string unitFileContent = BuildUnitFile(UnitConfiguration.SystemServiceOptions, commandOptions, substitutions);
 
-            string systemdServiceFilePath = $"/etc/systemd/system/{unitName}.service";
+            string systemdServiceFilePath;
+            if (userUnit)
+            {
+                string userUnitFolder = $"{Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)}/.config/systemd/user";
+                Directory.CreateDirectory(userUnitFolder);
+                systemdServiceFilePath = Path.Combine(userUnitFolder, $"{unitName}.service");
+            }
+            else
+            {
+                systemdServiceFilePath = $"/etc/systemd/system/{unitName}.service";
+            }
+
             try
             {
+                // TODO: permissions
                 using (FileStream fs = new FileStream(systemdServiceFilePath, FileMode.CreateNew))
                 {
                     using (StreamWriter sw = new StreamWriter(fs))
@@ -150,21 +190,20 @@ namespace Tmds.Systemd.Tool
             }
             catch (IOException) when (File.Exists(systemdServiceFilePath))
             {
-                System.Console.WriteLine("A service with that name already exists.");
-                return 1;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                string sudoCommand = "sudo";
-                if (scls != null)
-                {
-                    sudoCommand = $"{sudoCommand} scl enable {scls} --";
-                }
-                System.Console.WriteLine($"Cannot write file. Try running this command with '{sudoCommand}'.");
+                Console.WriteLine("A service with that name already exists.");
                 return 1;
             }
 
-            System.Console.WriteLine($"Writing service file to: {systemdServiceFilePath}");
+            Console.WriteLine($"Created service file at: {systemdServiceFilePath}");
+
+            Console.WriteLine();
+            Console.WriteLine("The following commands may be handy:");
+            string userOption = userUnit ? "--user" : string.Empty;
+            string sudoPrefix = userUnit ? string.Empty : "sudo ";
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} daemon-reload # Notify systemd a new service file exists");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} start {name}  # Start the service");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} status {name} # Check the service status");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} enable {name} # Automatically start the service");
 
             return 0;
         }
