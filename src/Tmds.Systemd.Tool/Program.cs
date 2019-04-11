@@ -6,91 +6,90 @@ using System.Collections.Generic;
 using System.Text;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace Tmds.Systemd.Tool
 {
     class Program
     {
-        const string Unit = nameof(Unit);
-        const string Service = nameof(Service);
-        const string Install = nameof(Install);
-
-        class Option
-        {
-            public Option(string section, string name, string @default)
-            {
-                Section = section;
-                Name = name;
-                Default = @default;
-            }
-            public string Section { get; set; }
-            public string Name { get; set; }
-            public string Default { get; set; }
-        }
-
-        static Option[] s_options = new Option[]
-        {
-            new Option(Unit, "Description", ".NET Core %name% service"),
-
-            new Option(Service, "Type", "simple"),
-            new Option(Service, "WorkingDirectory", "%assemblydirectory%"),
-            new Option(Service, "ExecStart", "%dotnetpath% %assemblypath%"),
-            new Option(Service, "Restart", "always"),
-            new Option(Service, "SyslogIdentifier", "%name%"),
-            new Option(Service, "User", null),
-            new Option(Service, "Group", null),
-
-            new Option(Install, "WantedBy", "multi-user.target"),
-        };
-
         static int Main(string[] args)
         {
-            var userOptions = new Dictionary<string, string>();
-            for (int i = 0; i < args.Length - 1; i++)
+            var rootCommand = new RootCommand();
+            rootCommand.AddCommand(CreateServiceCommand());
+            return rootCommand.InvokeAsync(args).Result;            
+        }
+
+        private static Command CreateServiceCommand()
+        {
+            var createServiceCommand = new Command("create-service", "Creates a systemd service", handler: CommandHandler.Create(new Func<string, string, ParseResult, int>(CreateServiceHandler)));
+            createServiceCommand.AddOption(new Option("--name", "Name of the service (required)", new Argument<string>()));
+            foreach (var configOption in UnitConfiguration.SystemServiceOptions)
             {
-                if (args[i].StartsWith("--"))
+                if (configOption.CanSet)
                 {
-                    userOptions.Add(args[i].Substring(2).ToUpperInvariant(), args[i + 1]);
+                    createServiceCommand.AddOption(new Option($"--{configOption.Name.ToLowerInvariant()}", $"Sets {configOption.Name}", new Argument<string>()));
                 }
             }
-            if (!userOptions.ContainsKey("NAME"))
-            {
-                Console.Error.WriteLine("A --name argument must be specified");
-                return 1;
-            }
-            var substitutions = new Dictionary<string, string>();
+            createServiceCommand.Argument = new Argument<string>() { Name = "application", Description = "Assembly to execute" };
+            return createServiceCommand;
+        }
 
-            System.Console.WriteLine(args.Length);
-            string assemblyPathValue = args.Length >= 1 ? args[0] : ".";
-            System.Console.WriteLine(assemblyPathValue);
-            assemblyPathValue = Path.GetFullPath(assemblyPathValue);
-            System.Console.WriteLine(assemblyPathValue);
-            if (Directory.Exists(assemblyPathValue))
+        private static Dictionary<string, string> GetCommandOptions(ParseResult result)
+        {
+            var userOptions = new Dictionary<string, string>();
+            foreach (var childResult in result.CommandResult.Children)
             {
-                assemblyPathValue = Directory.GetFiles(assemblyPathValue, "*.runtimeconfig.json")
+                userOptions.Add(childResult.Name.ToUpperInvariant(), childResult.Arguments.First());
+            }
+            return userOptions;
+        }
+
+        private static bool GetRequired(Dictionary<string, string> commandOptions, string name, out string value)
+        {
+            if (!commandOptions.TryGetValue(name.ToUpperInvariant(), out value))
+            {
+                Console.WriteLine($"Missing required option: --{name}");
+                return false;
+            }
+            return true;
+        }
+
+        private static bool ResolveAssembly(string application, out string assemblyValue)
+        {
+            assemblyValue = application;
+            assemblyValue = Path.GetFullPath(assemblyValue);
+            if (Directory.Exists(assemblyValue))
+            {
+                assemblyValue = Directory.GetFiles(assemblyValue, "*.runtimeconfig.json")
                                     .FirstOrDefault()?.Replace(".runtimeconfig.json", ".dll");
             }
-            System.Console.WriteLine(assemblyPathValue);
-            if (assemblyPathValue == null || !File.Exists(assemblyPathValue))
+            System.Console.WriteLine(assemblyValue);
+            if (assemblyValue == null || !File.Exists(assemblyValue))
             {
                 Console.Error.WriteLine("Cannot determine the entrypoint assembly. Please specify it as an argument.");
-                return 1;
+                return false;
             }
-            string nameValue = userOptions["NAME"];
-            substitutions.Add("%name%", nameValue);
-            string dotnetPathValue = FindProgramInPath("dotnet");
+
+            return true;
+        }
+
+        private static bool FindDotnetPath(out string dotnetPathValue)
+        {
+            dotnetPathValue = FindProgramInPath("dotnet");
             if (dotnetPathValue == null)
             {
                 System.Console.WriteLine("Cannot find dotnet on PATH");
-                return 1;
+                return false;
             }
-            substitutions.Add("%dotnetpath%", dotnetPathValue);
-            substitutions.Add("%assemblypath%", assemblyPathValue);
-            substitutions.Add("%assemblydirectory%", Path.GetDirectoryName(assemblyPathValue));
 
+            return true;
+        }
+
+        private static string BuildUnitFile(ConfigurationOption[] options, Dictionary<string, string> userOptions, Dictionary<string, string> substitutions)
+        {
             var sb = new StringBuilder();
             string currentSection = null;
-            foreach (var option in s_options)
+            foreach (var option in UnitConfiguration.SystemServiceOptions)
             {
                 string optionValue = Evaluate(option.Name, userOptions, option.Default, substitutions);
                 if (optionValue != null)
@@ -107,15 +106,36 @@ namespace Tmds.Systemd.Tool
                     sb.AppendLine($"{option.Name}={optionValue}");
                 }
             }
+            return sb.ToString();
+        }
+
+        private static int CreateServiceHandler(string name, string application, ParseResult result)
+        {
+            var commandOptions = GetCommandOptions(result);
+            
+            if (!GetRequired(commandOptions, "name", out string nameValue) ||
+                !ResolveAssembly(application, out string assemblyValue) ||
+                !FindDotnetPath(out string dotnetPathValue))
+            {
+                return 1;
+            }
+
+            var substitutions = new Dictionary<string, string>();
+            substitutions.Add("%name%", nameValue);
+            substitutions.Add("%dotnetpath%", dotnetPathValue);
+            substitutions.Add("%assemblypath%", assemblyValue);
+            substitutions.Add("%assemblydirectory%", Path.GetDirectoryName(assemblyValue));
+
+            string unitFileContent = BuildUnitFile(UnitConfiguration.SystemServiceOptions, commandOptions, substitutions);
+
             string systemdServiceFilePath = $"/etc/systemd/system/{nameValue}.service";
-            System.Console.WriteLine($"Writing service file to: {systemdServiceFilePath}");
             try
             {
                 using (FileStream fs = new FileStream(systemdServiceFilePath, FileMode.CreateNew))
                 {
                     using (StreamWriter sw = new StreamWriter(fs))
                     {
-                        sw.Write(sb.ToString());
+                        sw.Write(unitFileContent);
                     }
                 }
             }
@@ -130,7 +150,8 @@ namespace Tmds.Systemd.Tool
                 return 1;
             }
 
-            System.Console.WriteLine(sb);
+            System.Console.WriteLine($"Writing service file to: {systemdServiceFilePath}");
+
             return 0;
         }
 
@@ -168,21 +189,5 @@ namespace Tmds.Systemd.Tool
             }
             return userValue;
         }
-
-        static string ServiceTemplate = 
-@"[Unit]
-Description=My .NET Core Daemon
-
-[Service]
-Type=notify
-WorkingDirectory=/var/mydaemon
-ExecStart=/opt/dotnet/dotnet MyDaemon.dll
-Restart=always
-RestartSec=10
-SyslogIdentifier=mydaemon
-User=mydaemon
-
-[Install]
-WantedBy=multi-user.target";
     }
 }
