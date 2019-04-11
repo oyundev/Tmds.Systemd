@@ -113,22 +113,27 @@ namespace Tmds.Systemd.Tool
         {
             var commandOptions = GetCommandOptions(result);
             
-            if (!GetRequired(commandOptions, "name", out string nameValue) ||
-                !ResolveAssembly(application, out string assemblyValue) ||
-                !FindDotnetPath(out string dotnetPathValue))
+            if (!GetRequired(commandOptions, "name", out string unitName) ||
+                !ResolveAssembly(application, out string applicationPath) ||
+                !FindDotnetPath(out string dotnetPath))
             {
                 return 1;
             }
 
             var substitutions = new Dictionary<string, string>();
-            substitutions.Add("%name%", nameValue);
-            substitutions.Add("%dotnetpath%", dotnetPathValue);
-            substitutions.Add("%assemblypath%", assemblyValue);
-            substitutions.Add("%assemblydirectory%", Path.GetDirectoryName(assemblyValue));
+            substitutions.Add("%name%", unitName);
+            string execstart = $"'{dotnetPath}' '{applicationPath}'";
+            string scls = Environment.GetEnvironmentVariable("X_SCLS");
+            if (scls != null)
+            {
+                execstart = $"scl enable ${scls} -- {execstart}";
+            }
+            substitutions.Add("%execstart%", dotnetPath + " " + unitName);
+            substitutions.Add("%applicationdirectory%", Path.GetDirectoryName(applicationPath));
 
             string unitFileContent = BuildUnitFile(UnitConfiguration.SystemServiceOptions, commandOptions, substitutions);
 
-            string systemdServiceFilePath = $"/etc/systemd/system/{nameValue}.service";
+            string systemdServiceFilePath = $"/etc/systemd/system/{unitName}.service";
             try
             {
                 using (FileStream fs = new FileStream(systemdServiceFilePath, FileMode.CreateNew))
@@ -146,7 +151,12 @@ namespace Tmds.Systemd.Tool
             }
             catch (UnauthorizedAccessException)
             {
-                System.Console.WriteLine("Cannot write file. Try running this command with 'sudo'.");
+                string sudoCommand = "sudo";
+                if (scls != null)
+                {
+                    sudoCommand = $"{sudoCommand} scl enable {scls} --";
+                }
+                System.Console.WriteLine($"Cannot write file. Try running this command with '{sudoCommand}'.");
                 return 1;
             }
 
