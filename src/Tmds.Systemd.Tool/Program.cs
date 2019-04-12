@@ -1,7 +1,6 @@
 ﻿using System;
 using System.CommandLine;
 using System.CommandLine.Invocation;
-using System.CommandLine.DragonFruit;
 using System.Collections.Generic;
 using System.Text;
 using System.IO;
@@ -22,17 +21,14 @@ namespace Tmds.Systemd.Tool
 
         private static Command CreateServiceCommand()
         {
-            var createServiceCommand = new Command("create-service", "Creates a systemd service", handler: CommandHandler.Create(new Func<string, string, bool, ParseResult, int>(CreateServiceHandler)));
-            createServiceCommand.AddOption(new Option("--name", "Name of the service (required)", new Argument<string>()));
+            var createServiceCommand = new Command("create-service", "Creates a systemd service", handler: CommandHandler.Create(new Func<bool, ParseResult, int>(CreateServiceHandler)));
+            createServiceCommand.AddOption(new Option("--name", "Name of the service", new Argument<string>()));
             createServiceCommand.AddOption(new Option("--user-unit", "Create a user service", new Argument<bool>()));
-            foreach (var configOption in UnitConfiguration.SystemServiceOptions)
+            foreach (var configOption in ConfigurationOption.ServiceOptions)
             {
-                if (configOption.CanSet)
-                {
-                    createServiceCommand.AddOption(new Option($"--{configOption.Name.ToLowerInvariant()}", $"Sets {configOption.Name}", new Argument<string>()));
-                }
+                createServiceCommand.AddOption(new Option($"--{configOption.Name.ToLowerInvariant()}", $"Sets {configOption.Name}", new Argument<string>()));
             }
-            createServiceCommand.Argument = new Argument<string>() { Name = "application", Description = "Assembly to execute" };
+            // TODO: place this in a specific order and mark required arguments...
             return createServiceCommand;
         }
 
@@ -43,7 +39,7 @@ namespace Tmds.Systemd.Tool
             {
                 if (childResult.Arguments.Count > 0)
                 {
-                    userOptions.Add(childResult.Name.ToUpperInvariant(), childResult.Arguments.First());
+                    userOptions.Add(childResult.Name.ToLowerInvariant(), childResult.Arguments.First());
                 }
             }
             return userOptions;
@@ -51,7 +47,7 @@ namespace Tmds.Systemd.Tool
 
         private static bool GetRequired(Dictionary<string, string> commandOptions, string name, out string value)
         {
-            if (!commandOptions.TryGetValue(name.ToUpperInvariant(), out value))
+            if (!commandOptions.TryGetValue(name.ToLowerInvariant(), out value))
             {
                 Console.WriteLine($"Missing required option: --{name}");
                 return false;
@@ -59,20 +55,39 @@ namespace Tmds.Systemd.Tool
             return true;
         }
 
-        private static bool ResolveAssembly(string application, out string assemblyValue)
+        private static bool ResolveApplication(string execStartUser, out string execStart, out string workingDirectory)
         {
-            assemblyValue = application;
-            assemblyValue = Path.GetFullPath(assemblyValue);
-            if (Directory.Exists(assemblyValue))
+            workingDirectory = null;
+            if (File.Exists(execStartUser))
             {
-                assemblyValue = Directory.GetFiles(assemblyValue, "*.runtimeconfig.json")
-                                    .FirstOrDefault()?.Replace(".runtimeconfig.json", ".dll");
+                execStart = Path.GetFullPath(execStartUser);
             }
-            Console.WriteLine(assemblyValue);
-            if (assemblyValue == null || !File.Exists(assemblyValue))
+            else
             {
-                Console.Error.WriteLine("Cannot determine the entrypoint assembly. Please specify it as an argument.");
+                execStart = FindProgramInPath(execStartUser);
+            }
+            if (execStart == null)
+            {
+                Console.WriteLine($"Cannot find '{execStartUser}'");
                 return false;
+            }
+            workingDirectory = Path.GetDirectoryName(execStart);
+            if (execStart.EndsWith(".dll"))
+            {
+                if (!FindProgramInPath("dotnet", out string dotnetPath))
+                {
+                    return false;
+                }
+                execStart = $"'{dotnetPath}' '{execStart}'";
+            }
+            string scls = GetSoftwareCollections();
+            if (scls != null)
+            {
+                string sclPath = FindProgramInPath("scl");
+                if (sclPath != null)
+                {
+                    execStart = $"{sclPath} enable {scls} -- {execStart}";
+                }
             }
 
             return true;
@@ -94,7 +109,7 @@ namespace Tmds.Systemd.Tool
         {
             var sb = new StringBuilder();
             string currentSection = null;
-            foreach (var option in UnitConfiguration.SystemServiceOptions)
+            foreach (var option in ConfigurationOption.ServiceOptions)
             {
                 string optionValue = Evaluate(option.Name, userOptions, option.Default, substitutions);
                 if (optionValue != null)
@@ -136,34 +151,29 @@ namespace Tmds.Systemd.Tool
 
         private static string GetSoftwareCollections() => Environment.GetEnvironmentVariable("X_SCLS");
 
-        private static int CreateServiceHandler(string name, string application, bool userUnit, ParseResult result)
+        private static int CreateServiceHandler(bool userUnit, ParseResult result)
         {
             var commandOptions = GetCommandOptions(result);
-            
+
             if (!GetRequired(commandOptions, "name", out string unitName) ||
-                !ResolveAssembly(application, out string applicationPath) ||
-                !FindProgramInPath("dotnet", out string dotnetPath) ||
-                (!userUnit && !VerifyRunningAsRoot()))
+                !GetRequired(commandOptions, "execstart", out string execStartUser) ||
+                (!userUnit && !VerifyRunningAsRoot()) ||
+                !ResolveApplication(execStartUser, out string execStart, out string workingDirectory))
             {
                 return 1;
             }
 
-            var substitutions = new Dictionary<string, string>();
-            substitutions.Add("%name%", unitName);
-            string execstart = $"'{dotnetPath}' '{applicationPath}'";
-            string scls = GetSoftwareCollections();
-            if (scls != null)
+            commandOptions.Remove("execstart");
+            commandOptions.Add("execstart", execStart);
+            if (!commandOptions.ContainsKey("workingdirectory"))
             {
-                string sclPath = FindProgramInPath("scl");
-                if (sclPath != null)
-                {
-                    execstart = $"{sclPath} enable {scls} -- {execstart}";
-                }
+                commandOptions.Add("workingdirectory", workingDirectory);
             }
-            substitutions.Add("%execstart%", execstart);
-            substitutions.Add("%applicationdirectory%", Path.GetDirectoryName(applicationPath));
 
-            string unitFileContent = BuildUnitFile(UnitConfiguration.SystemServiceOptions, commandOptions, substitutions);
+            var substitutions = new Dictionary<string, string>();
+            substitutions.Add("%unitname%", unitName);
+
+            string unitFileContent = BuildUnitFile(ConfigurationOption.ServiceOptions, commandOptions, substitutions);
 
             string systemdServiceFilePath;
             if (userUnit)
@@ -201,9 +211,9 @@ namespace Tmds.Systemd.Tool
             string userOption = userUnit ? "--user" : string.Empty;
             string sudoPrefix = userUnit ? string.Empty : "sudo ";
             Console.WriteLine($"{sudoPrefix}systemctl {userOption} daemon-reload # Notify systemd a new service file exists");
-            Console.WriteLine($"{sudoPrefix}systemctl {userOption} start {name}  # Start the service");
-            Console.WriteLine($"{sudoPrefix}systemctl {userOption} status {name} # Check the service status");
-            Console.WriteLine($"{sudoPrefix}systemctl {userOption} enable {name} # Automatically start the service");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} start {unitName}  # Start the service");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} status {unitName} # Check the service status");
+            Console.WriteLine($"{sudoPrefix}systemctl {userOption} enable {unitName} # Automatically start the service");
 
             return 0;
         }
@@ -229,7 +239,7 @@ namespace Tmds.Systemd.Tool
         private static string Evaluate(string name, Dictionary<string, string> userOptions, string @default, Dictionary<string, string> substitutions)
         {
             string userValue;
-            if (!userOptions.TryGetValue(name.ToUpperInvariant(), out userValue))
+            if (!userOptions.TryGetValue(name.ToLowerInvariant(), out userValue))
             {
                 userValue = @default;
             }
